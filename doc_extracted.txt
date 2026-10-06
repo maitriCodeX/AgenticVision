@@ -1,0 +1,101 @@
+Agentic Navigation Assistant for the Visually Impaired (Android Prototype)
+0. How I want you to work
+Before writing code, produce an implementation plan (architecture, module list, model choices, risks) and wait for nothing; then proceed milestone by milestone in the order given in Section 11.
+After each milestone, build the app, run the tests, and fix errors before moving on. Do not leave stubs or TODOs in the final version. Every module must be functional.
+Where a requirement is impossible on Android (noted below), use the stated substitute and document the reason in docs/DECISIONS.md.
+Pin all dependency versions, and make the project build with a single ./gradlew assembleDebug.
+1. Project context
+Over 80 million visually impaired people in India rely on assistive apps that only output single-label detections (“Person”, “Chair”) with no distance, no direction, and no guidance. This project builds an Agentic Perception Pipeline: it sees, reasons, plans, and speaks, answering “How do I safely get from here to there?”
+The final product is a neckband with 4 x 120° cameras streaming to a phone app, with an open-ear earphone delivering voice instructions. This prototype replaces the neckband with the phone’s own camera and runs everything on-device in one Android app, with no cloud and no server. The prototype must be designed so the single camera can later be swapped for four cameras without rewriting the pipeline (see Section 4.1).
+2. Tech stack (mandatory unless noted)
+Language/UI: Kotlin, Jetpack Compose, Coroutines + Flow, min SDK 29, target latest stable SDK.
+Camera: CameraX (ImageAnalysis, STRATEGY_KEEP_ONLY_LATEST, 640x480 or 720p analysis stream, rotation-aware). Read the camera intrinsics (focal length, sensor size, FOV) from Camera2CameraInfo / CameraCharacteristics.
+Inference runtime: ONNX Runtime Mobile (Android) with the NNAPI or XNNPACK execution provider, with an automatic fallback to CPU. TFLite/LiteRT with the GPU delegate is acceptable for the depth model if it benchmarks faster.
+NOTE: TensorRT is NVIDIA-only and does not run on Android phones. The Android equivalent is ONNX Runtime + NNAPI/GPU delegates with INT8/FP16 quantization. Keep the ONNX export scripts so the same models can go through TensorRT later on a Jetson or similar device. Document this in DECISIONS.md.
+Object detection: YOLOv10 (start with yolov10n, benchmark yolov10s), exported to ONNX via Ultralytics. YOLOv10 is NMS-free, so parse its end-to-end output ([1, 300, 6]: x1, y1, x2, y2, score, class) and verify the shape on export. Use FP16 or INT8 (static quantization with a calibration set) if accuracy loss is under 2% mAP, otherwise FP16.
+Depth: MiDaS small (v2.1 small or the newest small ONNX/TFLite export), input about 256x256. Optional upgrade: Depth Anything V2 Small if it meets the latency target. Make the depth model swappable behind a DepthEstimator interface and benchmark both.
+Reasoning LLM: Phi-3 Mini (3.8B, 4-bit quantized) running fully on-device, via ONNX Runtime GenAI (preferred, Microsoft publishes Phi-3-mini int4 mobile builds) or llama.cpp via JNI (GGUF Q4_K_M). Expose it behind an LlmEngine interface. Include a smaller fallback (e.g. Phi-3.5 mini / Qwen2.5-1.5B Q4 / Gemma 2B) selectable in settings for low-RAM phones. Load the model in a background service and warm it up at launch.
+Speech output: Android TextToSpeech (offline voice, English plus Hindi, language switchable).
+Speech input (goal): Android SpeechRecognizer with offline recognition preferred, plus a text-box fallback and quick-goal buttons.
+Tracking math: implement the Kalman filter and the Hungarian/greedy data association yourself in Kotlin (no heavy dependencies); a small matrix helper is fine.
+Testing: JUnit for the math/logic, plus instrumented tests for the pipeline.
+3. System overview (data flow)
+CameraSource -> Frame -> [YOLOv10 detect] ─┐                      -> [MiDaS depth] ────┴-> Scene Fusion (3D objects: class, distance, bearing)        -> Multi-Object Tracker + Kalman (velocity, future position, time-to-collision)        -> Free-space / Walkable-path analysis (left / center / right clearance)        -> Safety Layer (rule-based, instant)      ──┐        -> Agentic LLM Reasoner (goal-aware, async) ─┴-> Instruction Arbiter -> TTS (+ haptics)
+Detection and depth run in parallel on each frame, on separate coroutine dispatchers. Drop frames rather than queue them. The pipeline always processes the freshest frame.
+4. Detailed module requirements
+4.1 Camera abstraction (future-proofing for 4 cameras)
+Define interface CameraSource { val id: String; val yawOffsetDeg: Float; val fovDeg: Float; val frames: Flow<Frame> }.
+Implement PhoneCameraSource (back camera, yaw 0°). Every 3D result must carry a bearing in the user-body frame, computed from the source’s yawOffsetDeg, so four sources (front 0°, right 90°, back 180°, left 270°) could be merged later. Add a stub MultiCameraFusion class that documents how this would work, plus a unit test using 4 simulated sources.
+4.2 Object detection
+Letterbox preprocessing, normalization, and output decoding in Kotlin with minimal allocations (reuse buffers, direct ByteBuffers).
+Confidence threshold configurable (default 0.4). Filter to the navigation-relevant classes (person, bicycle, car, motorcycle, bus, truck, dog, cat, chair, bench, couch, dining table, potted plant, stop sign, traffic light, fire hydrant, suitcase, backpack, etc.) but keep the full COCO set available in a debug toggle.
+Report per-stage latency.
+4.3 Depth estimation and METRIC distance (accuracy-critical)
+MiDaS outputs relative inverse depth, not meters. Do not present raw MiDaS values as metres. Implement a calibrated hybrid: 1. Anchor-based scale recovery: for detected objects with known real-world sizes (person about 1.65 m tall, car about 1.5 m tall, motorcycle about 1.2 m, chair about 0.9 m, door about 2.0 m, etc.), compute a pinhole-model distance Z = f_px * H_real / h_px using the camera intrinsics. Use these as metric anchors. 2. Fit scale and shift between the anchors and the MiDaS inverse depth per frame (robust fit such as RANSAC or Huber), and smooth the scale over time with an exponential filter. Apply it to the whole depth map to get a metric depth map. 3. Per-object distance: the median (not the mean) of metric depth over the central region of the bounding box, ignoring the outer 20% and outlier pixels. Fuse with the pinhole estimate if available, weighting by confidence. 4. Fallback: if ARCore Depth API is supported on the device, expose it as an optional DepthEstimator (behind a settings toggle) and compare accuracy. If no anchors are visible, hold the last good scale for up to N seconds and mark distances as “approximate”. 5. Add a calibration screen where the user places a known object (or a known distance, e.g. 1 m / 2 m marker) to improve the scale. Save the calibration. 6. Write an evaluation script/screen that logs estimated vs true distance (user enters the truth) and reports MAE, so I can measure accuracy.
+4.4 Scene fusion
+Produce, per frame, a list of SceneObject: (trackId, label, confidence, distanceM, bearingDeg [-: left, +: right], lateralOffsetM, position(x,z) in the ground plane, velocity(vx,vz), speed, approachState: APPROACHING|RECEDING|CROSSING|STATIC, ttcSeconds?, riskLevel). Bearing comes from the bounding-box centre x relative to the horizontal FOV. Example output string: “Motorbike 1.2 m ahead, 30° right, approaching.”
+4.5 Tracking and trajectory prediction
+Multi-object tracker (SORT/ByteTrack style: IoU plus distance gating, Hungarian or greedy assignment, track birth/confirmation/death rules).
+Kalman filter per track: constant-velocity model in the ground plane, state [x, z, vx, vz], with measurement noise that scales with distance (depth is noisier far away) and with the frame timestamp’s real dt. Compensate for camera motion where possible: use the phone’s gyroscope/rotation-vector sensor to subtract user rotation, and the accelerometer or step detector for rough ego-motion; document the limits.
+Predict positions 2 to 3 seconds ahead. Compute closest point of approach (CPA) and time-to-collision (TTC) against the user’s corridor (about 0.8 m wide in front of the user). Risk levels: SAFE / CAUTION / WARNING / CRITICAL with configurable thresholds (e.g. CRITICAL: TTC < 1.5 s or static obstacle < 1.0 m in the path).
+Unit tests with synthetic trajectories (object approaching, crossing, stationary, noisy detections).
+4.6 Free-space / walkable-path analysis
+Split the metric depth map into at least 5 horizontal sectors (far-left, left, centre, right, far-right) and compute the clearance distance per sector from the lower-middle part of the image (ground-level obstacles), taking detected objects into account.
+Detect basic hazards: obstacle in the path, narrowing gap, and a sudden drop in depth profile (possible step/stairs: flag as “uncertain surface ahead”).
+Output a PathAdvice object: recommended heading change in degrees (e.g. -20° means veer slightly left), with the clearance of each option.
+4.7 Agentic reasoning layer (Phi-3 Mini)
+The LLM is slow on phones (a few tokens/sec), so use a two-tier design:
+Tier 1: Safety Layer (rule-based, <100 ms, never waits for the LLM). Handles CRITICAL/WARNING events directly: “Stop. Motorbike approaching from the right.” This must always work even if the LLM fails or is still loading.
+Tier 2: Goal-oriented LLM agent (asynchronous, every 1 to 2 s or on significant scene change). - Input: the user’s goal (e.g. “find a chair”, “walk forward safely”, “cross this room”, “find the door”), plus a compact structured scene summary (JSON of the top 6 to 8 relevant objects with distance/bearing/velocity/risk, plus the sector clearances and the previous instruction). - Use a strict system prompt and constrained output (JSON with action in {FORWARD, SLIGHT_LEFT, LEFT, SLIGHT_RIGHT, RIGHT, STOP, WAIT, TURN_AROUND, GOAL_REACHED} and speech of at most 12 words). Validate the JSON, and fall back to the rule-based action if the output is invalid or times out (timeout about 1.5 s). - Keep prompts short (under about 300 tokens) with prefix/KV caching for the static system prompt. Cap generation at about 40 tokens, temperature about 0.2. - Goal grounding: map the user’s spoken goal to detectable classes (e.g. “chair” -> chair). For goals that COCO cannot detect (door, stairs, exit), tell the user clearly that the target cannot be detected and offer general guidance mode (“walk forward safely”). Do not hallucinate objects: the LLM may only refer to objects present in the scene JSON. - Include an Instruction Arbiter: the Safety Layer always preempts the LLM. Suppress contradictory instructions (e.g. never say “move left” if the left sector is blocked); the LLM’s action is validated against the free-space analysis before being spoken. - Provide a simple evaluation harness with 20+ scripted scene JSONs and expected action sets, and a unit test reporting the pass rate for the LLM tier and the safety layer.
+4.8 Speech output
+Priority queue: CRITICAL (interrupts immediately, flushes the queue) > WARNING > GUIDANCE > INFO.
+Anti-spam: per-object and per-message cooldowns, do not repeat the same instruction unless the situation changed, and shorten repeated warnings (“Stop.” instead of the full sentence).
+Short, direct phrases: “Stop”, “Slight left”, “Obstacle ahead, 1 metre”, “Clear path, walk forward”.
+Optional: stereo panning or earcon beeps indicating direction, and vibration patterns for CRITICAL events. Configurable speech rate and language (English/Hindi).
+Works with an open-ear Bluetooth earphone via the normal audio route.
+4.9 UI/UX (accessibility first)
+Main screen: a live camera preview with an optional debug overlay (boxes, track IDs, distance, velocity arrows, predicted paths, sector clearance bars, and depth-map picture-in-picture), off by default for end users, on for demos.
+Large, high-contrast Start/Stop button, goal input (voice button, text box, quick-goal chips), and a status line with FPS and latency per stage.
+Fully TalkBack-compatible (content descriptions, logical focus order). Hardware volume keys can start/stop and repeat the last instruction.
+Settings: models/precision, thresholds, speech language/rate, debug toggles, calibration, fallback LLM, and replay mode.
+Keep the screen on while running. Run the pipeline in a foreground service with a notification so it survives backgrounding. Handle camera/mic permissions gracefully with spoken prompts.
+4.10 Replay / testing mode (important)
+Add a mode that runs the pipeline on a recorded video file (and ideally records sessions with the pipeline’s outputs) so I can test repeatably indoors, plus a CSV/JSON log export of per-frame detections, distances, tracks, decisions, and latencies.
+5. Performance targets (mid-range Android, e.g. Snapdragon 7-series or better)
+Detection plus depth pipeline: >= 10 FPS end-to-end, target 15 FPS. Camera-to-safety-warning latency < 300 ms.
+LLM guidance update: one instruction per 1 to 2 s.
+Memory: stay under about 4 GB total; models are loaded once and the app must not leak (reuse buffers).
+Thermal: monitor PowerManager thermal status; reduce the depth resolution or the frame rate automatically when throttling, and speak a notice if performance degrades.
+Include a benchmark screen showing average and p95 latency for each stage and the device/provider used.
+6. Model preparation
+Provide a tools/ folder with Python scripts to: export YOLOv10 to ONNX (and quantize), export/convert MiDaS to ONNX/TFLite (and quantize), download the Phi-3 mini int4 ONNX GenAI (or GGUF) build, and validate the exports against reference outputs.
+Models are bundled or downloaded on first run (via an in-app download with a progress indicator and a checksum) because the LLM is about 2+ GB. Don’t commit large binaries to git.
+7. Safety, ethics, and honesty
+Show a first-launch spoken and written disclaimer: this is a research prototype and must not replace a white cane or a guide dog.
+If the pipeline stalls, models fail, or the camera is blocked/dark, say so aloud immediately (“Camera blocked”, “Navigation paused”). Never fail silently.
+Never speak a precise distance with false confidence: when metric scale is uncertain, say “about”, or use coarse bands (“very close”, “about 2 metres”).
+No cloud calls and no storage of camera frames unless the user enables session recording.
+8. Project structure
+app/  camera/        CameraSource, PhoneCameraSource, FrameConverter  perception/    YoloDetector, DepthEstimator(+MiDaS), MetricDepthCalibrator  fusion/        SceneFusion, SceneObject, MultiCameraFusion(stub)  tracking/      Tracker, KalmanFilter, TrajectoryPredictor, CollisionRisk  navigation/    FreeSpaceAnalyzer, PathAdvice  reasoning/     SafetyLayer, LlmEngine(+impl), PromptBuilder, GoalGrounder, InstructionArbiter  speech/        TtsManager, SpeechPrioritiser, GoalRecognizer  pipeline/      PipelineOrchestrator, FrameScheduler, PipelineService  ui/            Compose screens (Main, Settings, Calibration, Benchmark, Replay)  util/          Logging, Metrics, ThermalMonitortools/           python export/validation scriptsdocs/            ARCHITECTURE.md, DECISIONS.md, TESTING.md
+9. Documentation
+README.md: setup, model download, build and run steps, and a device compatibility table.
+docs/ARCHITECTURE.md: diagrams of the data flow and threading.
+docs/DECISIONS.md: every deviation (TensorRT -> ONNX Runtime/NNAPI, etc.) with reasons and the measured benchmarks.
+docs/TESTING.md: how to run the unit tests, the replay mode, the distance-accuracy evaluation, and the LLM evaluation harness.
+10. Acceptance criteria
+The app installs on a real Android phone, opens the camera, and runs the full chain: YOLOv10 -> depth -> fusion -> tracking/Kalman -> safety layer + Phi-3 reasoning -> spoken output, entirely offline.
+Pointing the phone at a person walking toward it produces a spoken warning such as “Person approaching, about 2 metres, slightly right” before the person is within about 1.5 m, and “Stop” when the TTC is critical.
+Saying “find a chair” produces step-by-step spoken guidance (turn/walk/stop) that gets toward a visible chair, and says “Chair reached” near it.
+Distance estimates are within about 15% (MAE reported by the evaluation tool) for objects between 1 and 5 m after calibration.
+Unit tests pass for the Kalman filter, tracker, TTC/CPA, free-space analysis, the arbiter, and prompt/JSON parsing.
+The benchmark screen shows the FPS and latency targets from Section 5 on my device (or documents honestly where they are missed and what was done about it).
+11. Milestones (build and verify each before the next)
+Project skeleton, CameraX preview, permissions, foreground service, and the CameraSource abstraction.
+YOLOv10 ONNX detection with overlay and latency metrics.
+MiDaS depth + metric calibration (anchors, scale fitting) + distance evaluation tool.
+Scene fusion + tracker + Kalman + trajectory/TTC/CPA + unit tests.
+Free-space analysis + rule-based Safety Layer + TTS with priority queue (a working “no-LLM” version of the app).
+Phi-3 Mini integration, goal input (voice/text), constrained JSON agent, the arbiter, and the evaluation harness.
+Replay mode, logging, benchmark screen, thermal handling, settings, and TalkBack accessibility pass.
+Documentation, cleanup, and a release-style debug APK.
+Start with the implementation plan now, then begin Milestone 1.
